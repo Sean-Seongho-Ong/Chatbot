@@ -1,0 +1,36 @@
+# FastAPI & Server
+fastapi
+uvicorn[standard] # ASGI 서버 (standard는 성능 관련 추가 라이브러리 포함)
+
+# Data Validation
+pydantic
+
+# Environment Variables
+python-dotenv
+
+# Machine Learning Core
+torch # PyTorch (CPU 또는 GPU 버전 필요)
+
+# Hugging Face Ecosystem
+transformers
+accelerate # transformers 모델 로딩 및 분산 처리 지원
+bitsandbytes # 4비트 양자화 지원
+peft # LoRA 어댑터 로딩 지원
+huggingface-hub # Hugging Face Hub API 접근
+
+# LangChain Ecosystem
+langchain
+langchain-community
+langgraph # LangChain 워크플로우 구성
+
+# Vector Database
+qdrant-client
+
+# Embeddings (main.py의 HuggingFaceEmbeddings 및 .env의 모델명 기준)
+sentence-transformers
+
+# Monitoring
+prometheus-client
+
+# System Utilities
+psutil # 시스템 리소스 모니터링 
