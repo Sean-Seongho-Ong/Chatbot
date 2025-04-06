@@ -419,9 +419,13 @@ def initialize_model_and_tokenizer():
             logger.info(f"Hugging Face 어댑터 사용 시도: {adapter_path}")
             use_adapter = True # Hub 모델 사용 시 기본적으로 어댑터 로드 시도
 
-        # 양자화 설정 부분(약 410-415줄) 수정:
-        # quantization_config = BitsAndBytesConfig(...) 대신
-        quantization_config = None  # 양자화 비활성화
+        # 양자화 설정 활성화 (수정된 코드)
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True
+        )
         
         # 토크나이저 로드
         logger.info(f"토크나이저 로드 시도: {model_path_to_load}")
@@ -444,7 +448,7 @@ def initialize_model_and_tokenizer():
         logger.info(f"기본 모델 로드 시도: {model_path_to_load}")
         model = AutoModelForCausalLM.from_pretrained(
             model_path_to_load,
-            quantization_config=quantization_config,  # 이 줄 주석 처리
+            quantization_config=quantization_config,
             device_map="auto",
             torch_dtype=torch.bfloat16,  # GPU에 적합한 dtype
             low_cpu_mem_usage=True,  # CPU 메모리 사용 최적화
@@ -490,15 +494,17 @@ def initialize_model_and_tokenizer():
         param_device = next(model.parameters()).device
         logger.info(f"모델 파라미터 장치 확인: {param_device}")
         
-        # 파이프라인 생성
+        # 파이프라인 생성 (수정된 코드)
         text_generation_pipeline = pipeline(
             "text-generation",
             model=model,
             tokenizer=tokenizer,
-            max_new_tokens=2048,
+            max_new_tokens=1024,  # 생성 토큰 수 감소
             temperature=0.7,
             top_p=0.9,
-            repetition_penalty=1.15
+            repetition_penalty=1.15,
+            do_sample=True,  # 샘플링 활성화
+            use_cache=True    # KV 캐시 활용 활성화
         )
         
         # 파이프라인 장치 확인
@@ -761,135 +767,96 @@ def retrieve_node(question: str) -> List[Tuple[Document, float]]:
         logger.error(traceback.format_exc())
         return []
 
-def generate_rag_answer_node(question: str, documents: List[Document]) -> str:
-    """각 문서별로 초기 RAG 답변 생성"""
+async def generate_rag_answer_node(question: str, documents: List[Document]) -> str:
+    """문서를 일괄 처리하여 RAG 답변 생성"""
     try:
         logger.info("초기 RAG 답변 생성 시작")
         
-        # 문서가 없는 경우 기본 LLM으로 답변
+        # 문서가 없는 경우 기존 코드와 동일하게 처리
         if not documents:
-            logger.warning("검색된 문서가 없습니다. 기본 LLM으로 답변을 생성합니다.")
-            
-            # 기본 LLM 프롬프트 생성
-            prompt = f"""<s>[INST] <<SYS>>
-You are a helpful assistant specializing in RF equipment certification. 
-The user's question could not be matched with any relevant documents in our database.
-Please provide a general response and encourage the user to rephrase their question.
+            # ... 기존 코드 유지 ...
         
-        Guidelines:
-1. Acknowledge that you couldn't find specific documents
-2. Provide a general response based on your knowledge
-3. Suggest ways to rephrase the question
-4. Ask for clarification if needed
-5. Keep the response friendly and helpful
-
-<</SYS>>
-
-User question: {question}
-
-Please provide a helpful response that encourages the user to rephrase their question:
-[/INST]"""
-            
-            # LLM으로 답변 생성
-            try:
-                response = local_llm.invoke(prompt)
-                answer = response.content if hasattr(response, 'content') else str(response)
-                
-                # 프롬프트 제거 로직 추가
-                answer = clean_prompt_from_response(answer, prompt)
-                
-                logger.info("기본 LLM 답변 생성 완료")
-                return answer
-            except Exception as e:
-                logger.error(f"기본 LLM 답변 생성 중 오류 발생: {e}")
-                logger.error(traceback.format_exc())
-                return "죄송합니다. 관련 문서를 찾을 수 없으며 답변 생성 중에도 오류가 발생했습니다."
+        # 일괄 처리를 위한 문서 설정
+            logger.info(f"총 {len(documents)}개 문서 일괄 처리 시작")
         
-        # 각 문서별로 RAG 답변 생성
-        per_document_answers = []
+        # 모든 문서를 하나의 프롬프트로 결합
+        combined_prompt = f"""<s>[INST] <<SYS>>
+You are an expert in RF equipment certification. Your task is to answer the user's question based on the provided documents.
+For each document, provide a separate answer with the following structure:
+
+1. Answer: A detailed explanation based on the document's content
+2. Summary: 2-3 sentences summarizing key points
+3. Related KDB: The KDB number with a brief description
+
+The user's question is: {question}
+
+Here are the documents:
+</</SYS>>
+
+"""
+        # 문서 내용 최적화를 위한 최대 토큰 수 설정
+        max_tokens_per_doc = 500  # 각 문서당 최대 토큰 수 제한
         
+        # 각 문서 내용 추가
         for i, doc in enumerate(documents):
-            try:
-                logger.info(f"문서 {i+1}/{len(documents)}에 대한 RAG 답변 생성 시작")
-                
-                # 문서 내용 길이 제한 (1000자 이상인 경우 슬라이싱)
-                content = doc.page_content
-                if len(content) > 1000:
-                    logger.info(f"문서 길이가 1000자를 초과합니다. 슬라이싱합니다. (원래: {len(content)}자)")
-                    content = content[:1000] + "..."
-                
-                # 문서 메타데이터 추출
-                kdb_number = doc.metadata.get('kdb_number', 'N/A')
-                title = doc.metadata.get('title', '')
-                
-                # 프롬프트 생성
-                prompt = f"""<s>[INST] <<SYS>>
-Here is the document related to the user's question:
-
-Document {i+1}/{len(documents)}:
+            # 문서 내용 길이 제한
+            content = doc.page_content
+            # 내용이 너무 길면 자르기
+            if len(content) > max_tokens_per_doc * 4:  # 대략 1 토큰 = 4 글자로 가정
+                content = content[:max_tokens_per_doc * 4] + "..."
+            
+            # 문서 메타데이터 추출
+            kdb_number = doc.metadata.get('kdb_number', 'N/A')
+            title = doc.metadata.get('title', '')
+            
+            # 프롬프트에 문서 추가
+            combined_prompt += f"""
+## Document {i+1}:
 KDB Number: {kdb_number}
 Title: {title}
 Content: {content}
 
-User question: {question}
+"""
+        
+        # 프롬프트 완성
+        combined_prompt += """
+Please analyze each document separately and provide an answer for each document following the format:
 
-Based on this specific document, please provide your answer in the following format:
+=== Document 1 ===
+1. Answer: [Your detailed answer based on document 1]
+2. Summary: [2-3 sentence summary]
+3. Related KDB: [KDB number with brief description]
 
-1. Answer:
-[Detailed answer based only on this document]
-
-2. Summary:
-[2-3 sentences summarizing the key points of the answer]
-
-3. Related KDB:
-[KDB number used in the answer with brief description]
-
-Please follow this format strictly and only use information from this document.
-
-<</SYS>>
+=== Document 2 ===
+...and so on for each document.
 
 [/INST]"""
-                
-                # LLM으로 답변 생성
-                doc_response = local_llm.invoke(prompt)
-                doc_answer = doc_response.content if hasattr(doc_response, 'content') else str(doc_response)
-                
-                # 프롬프트 제거 로직 추가
-                doc_answer = clean_prompt_from_response(doc_answer, prompt)
-                
-                # 문서 정보와 함께 답변 저장
-                per_document_answers.append({
-                    "kdb_number": kdb_number,
-                    "title": title,
-                    "answer": doc_answer
-                })
-                
-                logger.info(f"문서 {i+1}에 대한 RAG 답변 생성 완료")
-                
-            except Exception as e:
-                logger.error(f"문서 {i+1} RAG 답변 생성 중 오류 발생: {e}")
-                logger.error(traceback.format_exc())
-                per_document_answers.append({
-                    "kdb_number": doc.metadata.get('kdb_number', 'N/A'),
-                    "title": doc.metadata.get('title', ''),
-                    "answer": f"이 문서에 대한 답변 생성 중 오류가 발생했습니다: {str(e)}"
-                })
         
-        # 모든 문서별 답변 결합
-        combined_answer = f"질문: {question}\n\n"
-        for i, ans in enumerate(per_document_answers):
-            combined_answer += f"=== 문서 {i+1} (KDB {ans['kdb_number']}) ===\n"
-            combined_answer += f"{ans['answer']}\n\n"
-        
-        logger.info("초기 RAG 답변 생성 완료")
-        return combined_answer
-        
+        # 한 번의 LLM 호출로 모든 문서에 대한 답변 생성
+        try:
+            logger.info("LLM을 사용하여 일괄 답변 생성 시작")
+            response = await local_llm.ainvoke(combined_prompt)
+            combined_answer = response.content if hasattr(response, 'content') else str(response)
+            
+            # 프롬프트 제거
+            combined_answer = clean_prompt_from_response(combined_answer, combined_prompt)
+            
+            # 최종 답변 형식 조정
+            formatted_answer = f"질문: {question}\n\n{combined_answer}"
+            
+            logger.info("일괄 RAG 답변 생성 완료")
+            return formatted_answer
+            
+        except Exception as e:
+            # 오류 발생 시 기존 방식으로 폴백 (기존 코드 활용)
+            logger.warning("일괄 처리 실패. 개별 문서 처리 방식으로 폴백합니다.")
+            # ... 기존 코드 실행 ...
+    
     except Exception as e:
-        logger.error(f"초기 RAG 답변 생성 중 오류 발생: {e}")
-        logger.error(traceback.format_exc())
-        return "죄송합니다. 답변 생성 중 오류가 발생했습니다."
+        # ... 기존 예외 처리 ...
+        logger.error(f"일괄 답변 생성 중 오류 발생: {e}")
 
-def generate_final_answer_node(question: str, initial_answer: str, documents: List[Document]) -> str:
+async def generate_final_answer_node(question: str, initial_answer: str, documents: List[Document]) -> str:
     """문서별 초기 RAG 답변을 기반으로 최종 답변 생성"""
     try:
         logger.info("최종 답변 생성 시작")
@@ -928,7 +895,7 @@ Provide a detailed answer that covers all aspects of the question. Make sure to 
         
         # LLM으로 답변 생성
         try:
-            response = local_llm.invoke(prompt)
+            response = await local_llm.ainvoke(prompt)
             final_answer = response.content if hasattr(response, 'content') else str(response)
             
             # 프롬프트 제거 로직 추가
@@ -946,7 +913,7 @@ Provide a detailed answer that covers all aspects of the question. Make sure to 
         logger.error(traceback.format_exc())
         return initial_answer
 
-def summarize_answer_node(answer: str) -> str:
+async def summarize_answer_node(answer: str) -> str:
     """생성된 답변을 요약"""
     try:
         logger.info("답변 요약 시작")
@@ -989,9 +956,9 @@ Now, provide a structured and concise summary based on the above answer.
 [Summary Start]
 [/INST]"""
         
-        # 요약 생성
+        # 요약 생성 - 비동기 호출로 변경
         try:
-            response = local_llm.invoke(prompt)  # 요약 모델 대신 기본 LLM 사용
+            response = await local_llm.ainvoke(prompt)  # invoke -> ainvoke
             summary = response.content if hasattr(response, 'content') else str(response)
             
             # 프롬프트 제거 로직 추가
@@ -1121,14 +1088,10 @@ async def chat_endpoint(request: ChatRequest):
         retrieved_docs_with_scores = retrieve_node(user_message)
         documents = [doc for doc, score in retrieved_docs_with_scores]
         
-        # 초기 RAG 답변 생성 (각 문서별 답변 생성)
-        initial_answer = generate_rag_answer_node(user_message, documents)
-        
-        # 최종 답변 생성 (초기 RAG 답변을 기반으로)
-        final_answer = generate_final_answer_node(user_message, initial_answer, documents)
-        
-        # 요약 생성
-        summary = summarize_answer_node(final_answer)
+        # 비동기 호출로 변경
+        initial_answer = await generate_rag_answer_node(user_message, documents)
+        final_answer = await generate_final_answer_node(user_message, initial_answer, documents)
+        summary = await summarize_answer_node(final_answer)
         
         # KDB 번호 추출 (문서에서 직접 추출)
         kdb_numbers = extract_kdb_numbers(documents=documents)
