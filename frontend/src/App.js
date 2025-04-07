@@ -39,7 +39,19 @@ function App() {
     e.preventDefault();
     if (!input.trim()) return;
 
-    const userMessage = { role: 'user', content: input };
+    const now = new Date();
+    const timeString = now.toLocaleTimeString('ko-KR', { 
+      hour: '2-digit', 
+      minute: '2-digit', 
+      second: '2-digit',
+      hour12: false 
+    });
+
+    const userMessage = { 
+      role: 'user', 
+      content: input,
+      timestamp: timeString
+    };
     setMessages((prev) => [...prev, userMessage]);
     setInput('');
     setIsLoading(true);
@@ -49,13 +61,22 @@ function App() {
         messages: [userMessage],
       });
 
-      const { initial_answer, final_answer, documents } = response.data;
+      const { initial_answer, final_answer, rag_draft, documents } = response.data;
+      
+      const assistantTimeString = new Date().toLocaleTimeString('ko-KR', { 
+        hour: '2-digit', 
+        minute: '2-digit', 
+        second: '2-digit',
+        hour12: false 
+      });
       
       // 응답 데이터 구조화
       const assistantMessage = {
         role: 'assistant',
-        content: final_answer,
-        rag_answer: initial_answer,
+        initial_answer: initial_answer,
+        final_answer: final_answer,
+        rag_draft: rag_draft,
+        timestamp: assistantTimeString,
         referenced_kdbs: documents.map(doc => ({
           kdb_number: doc.metadata.kdb_number,
           title: doc.metadata.title || '제목 없음',
@@ -66,9 +87,16 @@ function App() {
       setMessages((prev) => [...prev, assistantMessage]);
     } catch (error) {
       console.error('Error sending message:', error);
+      const errorTimeString = new Date().toLocaleTimeString('ko-KR', { 
+        hour: '2-digit', 
+        minute: '2-digit', 
+        second: '2-digit',
+        hour12: false 
+      });
       setMessages((prev) => [...prev, { 
         role: 'assistant', 
-        content: '죄송합니다. 응답을 생성하는 중에 오류가 발생했습니다.' 
+        content: '죄송합니다. 응답을 생성하는 중에 오류가 발생했습니다.',
+        timestamp: errorTimeString
       }]);
     } finally {
       setIsLoading(false);
@@ -94,21 +122,30 @@ function App() {
         <div className="messages">
           {messages.map((message, index) => (
             <div key={index} className={`message ${message.role}`}>
+              <div className="message-timestamp">{message.timestamp}</div>
               {message.role === 'assistant' ? (
                 <>
-                  {/* 상세 답변 (RAG) */}
-                  {message.rag_answer && message.rag_answer.trim() && (
-                    <div className="original-answer">
-                      <h4>상세 답변 (RAG):</h4>
-                      <div className="answer-content">{message.rag_answer}</div>
+                  {/* 초기 답변 */}
+                  {message.initial_answer && message.initial_answer.trim() && (
+                    <div className="initial-answer">
+                      <h4>초기 답변:</h4>
+                      <div className="answer-content">{message.initial_answer}</div>
+                    </div>
+                  )}
+
+                  {/* 최종 답변 */}
+                  {message.final_answer && message.final_answer.trim() && (
+                    <div className="final-answer">
+                      <h4>최종 답변:</h4>
+                      <div className="answer-content">{message.final_answer}</div>
                     </div>
                   )}
 
                   {/* 요약 답변 */}
-                  {message.content && message.content.trim() && (
+                  {message.rag_draft && message.rag_draft.trim() && (
                     <div className="summary-answer">
-                      <h4>요약:</h4>
-                      <div className="answer-content">{message.content}</div>
+                      <h4>요약 답변:</h4>
+                      <div className="answer-content">{message.rag_draft}</div>
                     </div>
                   )}
 
