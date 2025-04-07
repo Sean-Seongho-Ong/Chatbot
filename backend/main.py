@@ -844,6 +844,33 @@ async def generate_final_answer_node(question: str, initial_answer: str, documen
             logger.warning("검색된 문서가 없습니다.")
             return initial_answer
         
+        # question과 initial_answer 간의 유사도 계산
+        try:
+            # 임베딩 모델이 초기화되어 있는지 확인
+            if embedding_model:
+                # 질문과 초기 답변의 임베딩 생성
+                question_embedding = embedding_model.embed_query(question)
+                answer_embedding = embedding_model.embed_query(initial_answer)
+                
+                # 코사인 유사도 계산
+                from numpy import dot
+                from numpy.linalg import norm
+                
+                # numpy 배열로 변환
+                import numpy as np
+                question_embedding_np = np.array(question_embedding)
+                answer_embedding_np = np.array(answer_embedding)
+                
+                # 코사인 유사도 계산
+                similarity = dot(question_embedding_np, answer_embedding_np) / (norm(question_embedding_np) * norm(answer_embedding_np))
+                
+                logger.info(f"질문과 초기 답변 간의 유사도: {similarity:.4f}")
+            else:
+                logger.warning("임베딩 모델이 초기화되지 않아 유사도를 계산할 수 없습니다.")
+        except Exception as e:
+            logger.error(f"유사도 계산 중 오류 발생: {e}")
+            logger.error(traceback.format_exc())
+        
         # 프롬프트 생성
         prompt = f"""<s>[INST] <<SYS>>
 You are a certification expert specializing in RF regulations. Your task is to provide a comprehensive and detailed answer based on the provided information.
