@@ -213,13 +213,6 @@ def cleanup_resources():
         logger.error(f"메모리 정리 중 오류 발생: {e}")
         logger.error(traceback.format_exc())
 
-# 메모리 사용량 모니터링
-def log_memory_usage():
-    process = psutil.Process()
-    memory_info = process.memory_info()
-    memory_usage.observe(memory_info.rss)
-    logger.info(f"Memory usage: {memory_info.rss / 1024 / 1024:.2f} MB")
-
 # 캐시된 응답 관리
 @lru_cache(maxsize=100)
 def get_cached_response(question: str):
@@ -232,113 +225,6 @@ def get_cached_response(question: str):
         logger.error(f"캐시 조회 중 오류 발생: {e}")
         return None
 
-# generate_response 함수 직접 구현
-def generate_response(state):
-    """검색된 문서를 기반으로 응답을 생성합니다."""
-    question = state["question"]
-    documents = state["documents"]
-    logger.info(f"'{question}'에 대한 응답 생성 시작")
-    log_memory_usage()
-    
-    try:
-        if not documents:
-            logger.warning("검색된 문서가 없습니다.")
-            state["error"] = "검색된 문서가 없습니다."
-            state["answer"] = "죄송합니다. 관련 문서를 찾을 수 없습니다."
-            return state
-            
-        # 문서 내용 추출
-        context = "\n\n".join([doc.content for doc in documents])
-        
-        # KDB 번호 수집
-        kdb_numbers = set()
-        for doc in documents:
-            if doc.metadata and 'kdb_number' in doc.metadata:
-                kdb_numbers.update(doc.metadata['kdb_number'])
-        
-        # KDB 번호가 있는 경우 추가 문서 검색
-        additional_docs = []
-        if kdb_numbers:
-            try:
-                for kdb_number in kdb_numbers:
-                    # Qdrant 클라이언트를 직접 사용하여 검색
-                    search_vector = vector_store_2.embeddings.embed_query(f"KDB 번호 {kdb_number}에 대한 문서")
-                    search_results = qdrant_client_instance.search(
-                        collection_name="fcc_kdb_docs",
-                        query_vector=search_vector,
-                        limit=2,
-                        score_threshold=0.5,
-                        query_filter=qdrant_models.Filter(
-                            must=[
-                                qdrant_models.FieldCondition(
-                                    key="kdb_number",
-                                    match=qdrant_models.MatchValue(value=kdb_number)
-                                )
-                            ]
-                        )
-                    )
-                    
-                    # 검색 결과를 Document 객체로 변환
-                    for hit in search_results:
-                        if hit.payload.get('content') is not None:
-                            doc = Document(
-                                page_content=hit.payload['content'],
-                                metadata={
-                                    'kdb_number': hit.payload.get('kdb_number', []),
-                                    'version': hit.payload.get('metadata', {}).get('version', ''),
-                                    'title': hit.payload.get('title', ''),
-                                    'document_number': hit.payload.get('document_number', '')
-                                }
-                            )
-                            additional_docs.append((doc, hit.score))
-            except Exception as e:
-                logger.error(f"KDB 번호 관련 문서 검색 중 오류 발생: {e}")
-                logger.error(traceback.format_exc())
-        
-        # 추가 문서가 있는 경우 context에 추가
-        if additional_docs:
-            additional_context = "\n\n".join([doc.page_content for doc, _ in additional_docs])
-            context = f"{context}\n\nAdditional related documents:\n{additional_context}"
-        
-        # 프롬프트 생성
-        prompt = f"""<s>[INST] <<SYS>>
-Here are the documents related to the user's question: {context}
-
-User question: {question}
-
-Based on the above documents, please provide your answer in the following format:
-
-1. Answer:
-[Detailed answer based on the retrieved documents]
-
-2. Summary:
-[2-3 sentences summarizing the key points of the answer]
-
-3. Related KDB:
-[KDB numbers used in the answer with brief descriptions]
-
-Please follow this format strictly.
-
-<</SYS>>
-
-
-[/INST]"""
-
-        # 응답 생성
-        response = local_llm.invoke(prompt)
-        answer = response.content
-        
-        state["answer"] = answer
-        state["error"] = None
-        log_memory_usage()
-        
-    except Exception as e:
-        logger.error(f"응답 생성 중 오류 발생: {e}")
-        logger.error(traceback.format_exc())
-        state["error"] = f"응답 생성 중 오류 발생: {e}"
-        state["answer"] = "죄송합니다. 응답을 생성하는 중에도 오류가 발생했습니다."
-    
-    return state
 
 def check_local_model_files(directory):
     """주어진 디렉토리에 모델 및 토크나이저 필수 파일이 있는지 확인"""
