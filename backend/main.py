@@ -477,7 +477,7 @@ def init_vector_store():
                 # 컬렉션 크기 확인
                 points_count = qdrant_client_instance.count(COLLECTION_NAME).count
                 logger.info(f"컬렉션 '{COLLECTION_NAME}'의 문서 수: {points_count}")
-                
+            
             # 두 번째 컬렉션 확인 및 생성
             if COLLECTION_NAME_2 not in collection_names:
                 logger.warning(f"Qdrant 컬렉션 '{COLLECTION_NAME_2}'이 존재하지 않습니다. 새로 생성합니다.")
@@ -545,20 +545,46 @@ def retrieve_node(question: str) -> List[Tuple[Document, float]]:
         
         # 1. 첫 번째 컬렉션에서 검색
         try:
-            results_1 = vector_store.similarity_search_with_score(
-                question,
-                k=5  # 상위 5개 문서 검색
+            # 네이티브 Qdrant 클라이언트를 사용하여 직접 검색
+            search_vector = embedding_model.embed_query(question)
+            search_results = qdrant_client_instance.search(
+                collection_name=COLLECTION_NAME,
+                query_vector=search_vector,
+                limit=10,
+                with_payload=True
             )
-            logger.info(f"첫 번째 컬렉션 검색 결과: {len(results_1)}개 문서")
             
-            # Qdrant에서 가져온 페이로드 필드를 제대로 처리
-            for i, (doc, score) in enumerate(results_1):
-                if not hasattr(doc, 'metadata') or doc.metadata is None:
-                    doc.metadata = {}
-                doc.metadata['score'] = score
-                # 필요하다면 content 필드를 page_content로 복사
-                if not doc.page_content and 'content' in doc.metadata:
-                    doc.page_content = doc.metadata['content']
+            # 검색 결과를 Document 객체로 변환
+            results_1 = []
+            for i, hit in enumerate(search_results):
+                if hit.payload:
+                    # 페이로드에서 콘텐츠 필드 이름 확인 (page_content 또는 content 가능)
+                    content_field = 'content'
+                    if 'page_content' in hit.payload:
+                        content_field = 'page_content'
+                    
+                    content = hit.payload.get(content_field)
+                    if content:
+                        # 메타데이터는 페이로드 전체를 포함
+                        metadata = hit.payload.copy()
+                        # 콘텐츠 필드 제거 (중복 방지)
+                        if content_field in metadata:
+                            del metadata[content_field]
+                        # 유사도 점수 추가
+                        metadata['score'] = hit.score
+                        doc = Document(page_content=content, metadata=metadata)
+                        results_1.append((doc, hit.score))
+                        
+                        # 로깅
+                        kdb_number = metadata.get('kdb_number', 'N/A')
+                        first_category = metadata.get('first_category', 'N/A')
+                        second_category = metadata.get('second_category', 'N/A')
+                        logger.info(f"[컬렉션1] 문서 {i+1} 처리 완료 - KDB: {kdb_number}, "
+                                   f"1차 카테고리: {first_category}, "
+                                   f"2차 카테고리: {second_category}, "
+                                   f"유사도 점수: {hit.score:.4f}")
+            
+            logger.info(f"첫 번째 컬렉션 검색 결과: {len(results_1)}개 문서")
             
         except Exception as e:
             logger.error(f"첫 번째 컬렉션 검색 중 오류 발생: {e}")
@@ -572,7 +598,7 @@ def retrieve_node(question: str) -> List[Tuple[Document, float]]:
             search_results = qdrant_client_instance.search(
                 collection_name=COLLECTION_NAME_2,
                 query_vector=search_vector,
-                limit=5,
+                limit=10,
                 with_payload=True
             )
             
@@ -596,6 +622,10 @@ def retrieve_node(question: str) -> List[Tuple[Document, float]]:
                         metadata['score'] = hit.score
                         doc = Document(page_content=content, metadata=metadata)
                         results_2.append((doc, hit.score))
+                        # 로깅
+                        kdb_number = metadata.get('kdb_number', 'N/A')
+                        logger.info(f"[컬렉션2] 문서 {i+1} 처리 완료 - KDB: {kdb_number}, "
+                                   f"유사도 점수: {hit.score:.4f}")
             
             logger.info(f"두 번째 컬렉션 검색 결과: {len(results_2)}개 문서")
         except Exception as e:
@@ -603,144 +633,206 @@ def retrieve_node(question: str) -> List[Tuple[Document, float]]:
             logger.error(traceback.format_exc())
             results_2 = []
         
-        # 3. 결과 병합 및 중복 제거 (KDB 번호 기준)
-        collection2_kdb_numbers = set()
-        unique_results = []
+        # 3. 결과 병합 (유사도 점수 기준)
+        all_results = []
         
-        # 먼저 컬렉션2에서 가져온 KDB 번호들 수집
+        # 컬렉션2의 결과 추가
         for doc, score in results_2:
             try:
-                # 여기서 페이로드의 상위 레벨에 저장된 kdb_number에 접근
-                kdb_number = doc.metadata.get('kdb_number')
-                if kdb_number:
-                    if isinstance(kdb_number, list):
-                        collection2_kdb_numbers.update(kdb_number)
-                    else:
-                        collection2_kdb_numbers.add(kdb_number)
-                
-                # 유효한 문서는 바로 결과에 추가
+                all_results.append((doc, score))
                 logger.debug(f"문서 내용 확인(컬렉션2): {doc.page_content[:100]}... (길이: {len(doc.page_content)})")
-                unique_results.append((doc, score))
             except Exception as doc_err:
                 logger.error(f"문서 처리 중 오류 발생: {doc_err}")
                 continue
         
-        # 컬렉션1에서 가져온 문서 중 컬렉션2에 없는 KDB 번호만 추가
+        # 컬렉션1의 결과 추가
         for doc, score in results_1:
             try:
-                # 여기서 페이로드의 상위 레벨에 저장된 kdb_number에 접근
-                kdb_number = doc.metadata.get('kdb_number')
-                # KDB 번호가 없거나 컬렉션2에 이미 있는 경우 제외
-                if not kdb_number or kdb_number in collection2_kdb_numbers:
-                    continue
-                
-                # 메타데이터에 유사도 점수 추가
-                doc.metadata['score'] = score
-                
-                content = doc.page_content
-                if content:
-                    logger.debug(f"문서 내용 확인(컬렉션1): {content[:100]}... (길이: {len(content)})")
-                    unique_results.append((doc, score))
+                all_results.append((doc, score))
+                logger.debug(f"문서 내용 확인(컬렉션1): {doc.page_content[:100]}... (길이: {len(doc.page_content)})")
             except Exception as doc_err:
                 logger.error(f"문서 처리 중 오류 발생: {doc_err}")
                 continue
         
-        logger.info(f"최종 검색 결과: {len(unique_results)}개 고유 문서")
-        return unique_results
+        # 유사도 점수가 0.7 이상인 문서만 필터링하고 유사도 점수 기준으로 정렬
+        filtered_results = [(doc, score) for doc, score in all_results if score >= 0.7]
+        filtered_results.sort(key=lambda x: x[1], reverse=True)
+        
+        # 최종 결과 반환 (유사도 0.7 이상인 문서만)
+        final_results = filtered_results
+        
+        logger.info(f"최종 검색 결과: {len(final_results)}개 문서 (유사도 0.7 이상)")
+        return final_results
         
     except Exception as e:
         logger.error(f"문서 검색 중 오류 발생: {e}")
         logger.error(traceback.format_exc())
         return []
 
+
 async def generate_rag_answer_node(question: str, documents: List[Document]) -> str:
-    """문서를 일괄 처리하여 RAG 답변 생성"""
+    """문서를 배치 처리하여 RAG 답변 생성"""
     try:
         logger.info("초기 RAG 답변 생성 시작")
         
-        # 문서가 없는 경우 기존 코드와 동일하게 처리
+        # 문서가 없는 경우 기본 LLM + QLoRA를 사용하여 답변 생성
         if not documents:
-            # ... 기존 코드 유지 ...
-        
-        # 일괄 처리를 위한 문서 설정
-            logger.info(f"총 {len(documents)}개 문서 일괄 처리 시작")
-        
-        # 모든 문서를 하나의 프롬프트로 결합
-        combined_prompt = f"""<s>[INST] <<SYS>>
-You are an expert in RF equipment certification. Your task is to answer the user's question based on the provided documents.
-For each document, provide a separate answer with the following structure:
+            logger.info("관련 문서가 없어 기본 LLM + QLoRA를 사용하여 답변을 생성합니다.")
+            base_prompt = f"""<s>[INST] <<SYS>>
+You are an expert in RF equipment certification. Your task is to answer the user's question based on your knowledge.
+Please provide a detailed and accurate answer.
 
-1. Answer: A detailed explanation based on the document's content
-2. Summary: 2-3 sentences summarizing key points
-3. Related KDB: The KDB number with a brief description
+Guidelines:
+1. Provide a comprehensive explanation with technical details
+2. Include relevant regulatory requirements and specifications
+3. Use clear, professional language
+4. Structure the answer with proper sections and formatting
+5. If certain information is not available, clearly state that
 
 The user's question is: {question}
-
-Here are the documents:
 </</SYS>>
 
-"""
-        # 문서 내용 최적화를 위한 최대 토큰 수 설정
-        max_tokens_per_doc = 500  # 각 문서당 최대 토큰 수 제한
-        
-        # 각 문서 내용 추가
-        for i, doc in enumerate(documents):
-            # 문서 내용 길이 제한
-            content = doc.page_content
-            # 내용이 너무 길면 자르기
-            if len(content) > max_tokens_per_doc * 4:  # 대략 1 토큰 = 4 글자로 가정
-                content = content[:max_tokens_per_doc * 4] + "..."
+Please provide a comprehensive answer to the question above. [/INST]"""
             
-            # 문서 메타데이터 추출
-            kdb_number = doc.metadata.get('kdb_number', 'N/A')
-            title = doc.metadata.get('title', '')
-            
-            # 프롬프트에 문서 추가
-            combined_prompt += f"""
-## Document {i+1}:
-KDB Number: {kdb_number}
-Title: {title}
-Content: {content}
-
-"""
+            try:
+                response = await local_llm.ainvoke(base_prompt)
+                answer = response.content if hasattr(response, 'content') else str(response)
+                answer = clean_prompt_from_response(answer, base_prompt)
+                formatted_answer = f"질문: {question}\n\n{answer}"
+                logger.info("기본 LLM + QLoRA를 사용한 답변 생성 완료")
+                logger.info(f"생성된 답변:\n{formatted_answer}")
+                return formatted_answer
+            except Exception as e:
+                logger.error(f"기본 LLM + QLoRA 답변 생성 중 오류 발생: {e}")
+                raise
         
-        # 프롬프트 완성
-        combined_prompt += """
-Please analyze each document separately and provide an answer for each document following the format:
+        # 문서를 유사도 점수 기준으로 정렬
+        sorted_documents = sorted(documents, key=lambda x: x.metadata.get('score', 0), reverse=True)
+        
+        # 배치 크기 설정 (한 번에 처리할 문서 수)
+        batch_size = 3
+        document_batches = [sorted_documents[i:i+batch_size] for i in range(0, len(sorted_documents), batch_size)]
+        
+        # 각 배치별 처리 결과 저장
+        all_document_summaries = []
+        kdb_numbers = set()
+        
+        # 배치별 처리
+        for batch_idx, batch in enumerate(document_batches):
+            try:
+                logger.info(f"배치 {batch_idx+1}/{len(document_batches)} 처리 시작 (문서 수: {len(batch)})")
+                
+                # 배치 내 문서 정보 수집
+                batch_contents = []
+                batch_metadata = []
+                
+                for doc in batch:
+                    # 문서 메타데이터 추출
+                    kdb_number = doc.metadata.get('kdb_number', 'N/A')
+                    title = doc.metadata.get('title', '')
+                    score = doc.metadata.get('score', 0)
+                    
+                    # KDB 번호 수집
+                    if kdb_number != 'N/A':
+                        kdb_numbers.add(kdb_number)
+                    
+                    # 배치 처리용 정보 수집
+                    batch_contents.append(doc.page_content)
+                    batch_metadata.append({
+                        'kdb_number': kdb_number,
+                        'title': title,
+                        'score': score
+                    })
+                
+                # 배치 처리용 프롬프트 생성
+                batch_prompt = f"""<s>[INST] <<SYS>>
+You are an expert in RF equipment certification. Based on the following documents, answer the user's question.
 
-=== Document 1 ===
-1. Answer: [Your detailed answer based on document 1]
-2. Summary: [2-3 sentence summary]
-3. Related KDB: [KDB number with brief description]
+Guidelines:
+1. For each document, extract information relevant to the question
+2. Include technical details and specifications from each document
+3. Maintain accuracy and clarity
+4. If a document doesn't contain relevant information, state that clearly
+5. Structure your answer by document, clearly indicating which document each piece of information comes from
 
-=== Document 2 ===
-...and so on for each document.
+Question: {question}
 
+Documents:
+"""
+                
+                # 각 문서 정보 추가
+                for i, (content, metadata) in enumerate(zip(batch_contents, batch_metadata)):
+                    batch_prompt += f"""
+[Document {i+1} - KDB: {metadata['kdb_number']}, Title: {metadata['title']}, Relevance: {metadata['score']:.4f}]
+{content}
+"""
+                
+                batch_prompt += """
+Please provide a detailed answer based on these documents, clearly indicating which document each piece of information comes from.
 [/INST]"""
+                
+                # 배치 처리로 답변 생성
+                logger.info(f"배치 {batch_idx+1} 답변 생성 시작")
+                batch_response = await local_llm.ainvoke(batch_prompt)
+                batch_answer = batch_response.content if hasattr(batch_response, 'content') else str(batch_response)
+                batch_answer = clean_prompt_from_response(batch_answer, batch_prompt)
+                logger.info(f"배치 {batch_idx+1} 답변 생성 완료")
+                
+                # 배치 답변 추가
+                all_document_summaries.append(f"\n[배치 {batch_idx+1} 답변]\n{batch_answer}")
+                
+            except Exception as e:
+                logger.error(f"배치 {batch_idx+1} 처리 중 오류 발생: {e}")
+                continue
         
-        # 한 번의 LLM 호출로 모든 문서에 대한 답변 생성
+        # 모든 배치의 답변을 결합
+        combined_content = "\n".join(all_document_summaries)
+        logger.info(f"모든 배치의 답변 결합 완료")
+        
+        # KDB 번호 목록 생성
+        kdb_list = ", ".join(sorted(kdb_numbers)) if kdb_numbers else "N/A"
+        
+        # 최종 종합 답변 생성
+        final_prompt = f"""<s>[INST] <<SYS>>
+You are an expert in RF equipment certification. Based on the following document-specific answers, provide a comprehensive answer to the user's question.
+
+Guidelines:
+1. Synthesize information from all documents
+2. Resolve any conflicts between documents
+3. Prioritize information from documents with higher relevance scores
+4. Maintain technical accuracy and clarity
+5. Structure the answer logically
+6. Include specific references to KDB documents when relevant
+
+Document-Specific Answers:
+{combined_content}
+
+Question: {question}
+</</SYS>>
+
+Please provide a comprehensive answer that synthesizes all the information above. [/INST]"""
+        
+        # 최종 답변 생성
         try:
-            logger.info("LLM을 사용하여 일괄 답변 생성 시작")
-            response = await local_llm.ainvoke(combined_prompt)
-            combined_answer = response.content if hasattr(response, 'content') else str(response)
-            
-            # 프롬프트 제거
-            combined_answer = clean_prompt_from_response(combined_answer, combined_prompt)
+            logger.info("최종 종합 답변 생성 시작")
+            response = await local_llm.ainvoke(final_prompt)
+            final_answer = response.content if hasattr(response, 'content') else str(response)
+            final_answer = clean_prompt_from_response(final_answer, final_prompt)
             
             # 최종 답변 형식 조정
-            formatted_answer = f"질문: {question}\n\n{combined_answer}"
+            formatted_answer = f"질문: {question}\n\n{final_answer}"
             
-            logger.info("일괄 RAG 답변 생성 완료")
+            logger.info("종합 RAG 답변 생성 완료")
+            logger.info(f"생성된 답변:\n{formatted_answer}")
             return formatted_answer
             
         except Exception as e:
-            # 오류 발생 시 기존 방식으로 폴백 (기존 코드 활용)
-            logger.warning("일괄 처리 실패. 개별 문서 처리 방식으로 폴백합니다.")
-            # ... 기존 코드 실행 ...
+            logger.error(f"최종 답변 생성 중 오류 발생: {e}")
+            raise
     
     except Exception as e:
-        # ... 기존 예외 처리 ...
-        logger.error(f"일괄 답변 생성 중 오류 발생: {e}")
+        logger.error(f"RAG 답변 생성 중 오류 발생: {e}")
+        raise
 
 async def generate_final_answer_node(question: str, initial_answer: str, documents: List[Document]) -> str:
     """문서별 초기 RAG 답변을 기반으로 최종 답변 생성"""
@@ -782,11 +874,12 @@ Provide a detailed answer that covers all aspects of the question. Make sure to 
         # LLM으로 답변 생성
         try:
             response = await local_llm.ainvoke(prompt)
+            logger.info(f"최종 답변 원본:\n{response}")
             final_answer = response.content if hasattr(response, 'content') else str(response)
-            
+            logger.info(f"클린처리 전 최종 답변:\n{final_answer}")
             # 프롬프트 제거 로직 추가
             final_answer = clean_prompt_from_response(final_answer, prompt)
-            
+            logger.info(f"처리된 최종 답변:\n{final_answer}")
             logger.info("최종 답변 생성 완료")
             return final_answer
         except Exception as e:
@@ -873,15 +966,15 @@ def clean_prompt_from_response(response: str, prompt: str) -> str:
             
         # 출력에서 [INST] 태그 및 시스템 지시어 제거 (정규식 접근)
         import re
-        # [INST] 태그 및 내용 제거
-        cleaned = re.sub(r'<s>\s*\[INST\].*?(\[/INST\])', '', response, flags=re.DOTALL)
+        # [INST] 태그만 제거 (내용은 보존)
+        cleaned = re.sub(r'<s>\s*\[INST\]\s*', '', response)
+        cleaned = re.sub(r'\s*\[/INST\]', '', cleaned)
         # <<SYS>> 태그 및 내용 제거
         cleaned = re.sub(r'<<SYS>>.*?<</SYS>>', '', cleaned, flags=re.DOTALL)
         # [Summary Start] 등 마커 제거
-        cleaned = re.sub(r'\[Summary Start\]', '', cleaned, flags=re.DOTALL)
+        cleaned = re.sub(r'\[Summary Start\]', '', cleaned)
         # 남은 태그 제거
         cleaned = re.sub(r'</?s>', '', cleaned)
-        cleaned = re.sub(r'\[/INST\]', '', cleaned)
         
         # 여러 줄 공백 제거
         cleaned = re.sub(r'\n\s*\n', '\n\n', cleaned)
